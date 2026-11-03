@@ -113,7 +113,10 @@ class Store(ctx: Context) {
         for (d in allDays()) { if (d.total <= d.cap) { run++; best = max(best, run) } else run = 0 }
         return best
     }
-
+fun resetToday() {
+        p.edit().putInt("ig", 0).putInt("yt", 0).putFloat("damage", 0f)
+            .putLong("lastTs", 0L).putInt("gate", 100).apply()
+}
     fun dbg(line: String) {
         val old = (p.getString("dbg", "") ?: "").split("\n").filter { it.isNotBlank() }
         p.edit().putString("dbg", (listOf(line) + old).take(6).joinToString("\n")).apply()
