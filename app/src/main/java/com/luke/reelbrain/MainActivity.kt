@@ -109,6 +109,7 @@ class MainActivity : AppCompatActivity() {
             }.start()
         }
         setup.addView(unlock)
+        setup.addView(btn("Reset today's count") { store.resetToday(); refresh() })
         col.addView(section("Setup & options", setup, !serviceOn()))
 
         brain = BrainView(this)
@@ -164,7 +165,7 @@ class MainActivity : AppCompatActivity() {
         val i = store.integrity()
         brain.integrity = i
         bar.value = i
-        todayTv.text = "Today: ${store.total()} / ${store.cap}   (IG ${store.ig()} · YT ${store.yt()})"
+        todayTv.text = "Today: ${store.total()} / ${store.cap}"
         streakTv.text = "Streak: ${store.streak()} days under limit  ·  Best: ${store.bestStreak()}"
         val map = store.allDays().associateBy { it.date }
         calBox.removeAllViews()
