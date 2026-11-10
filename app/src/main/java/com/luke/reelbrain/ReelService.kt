@@ -31,7 +31,7 @@ class ReelService : AccessibilityService() {
         const val BREATHS = 10
     }
 
-    private class Scan(val tokens: Set<String>, val reel: Boolean)
+    private class Scan(val found: Boolean, val key: Int, val tokens: Set<String>, val ids: String)
 
     private val store by lazy { Store(this) }
     private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
@@ -51,12 +51,20 @@ class ReelService : AccessibilityService() {
     private var lastBig = 0L
     private var lastIdx = -1
     private var commentsUntil = 0L
-    private var lastTokens: Set<String> = emptySet()
+    private var lastKey = 0
+    private var ytTokens: Set<String> = emptySet()
+    private var ytMiss = 0
+    private var keyTrusted = false
     private var misses = 0
     private var breathStart = 0L
 
     private val hidePopup = Runnable { popupView?.visibility = View.GONE }
     private val autoLeave = Runnable { if (block != null) leaveBlock() }
+    private val ytRescan = Runnable {
+        if (breathe != null) return@Runnable
+        val now = SystemClock.elapsedRealtime()
+        if (evalYt(now, true)) registerReel(1, now)
+    }
     private val poll = object : Runnable {
         override fun run() {
             val pkg = rootInActiveWindow?.packageName?.toString()
@@ -88,14 +96,21 @@ class ReelService : AccessibilityService() {
         if (breathe != null) return
         lastPkg = pkg
         val now = SystemClock.elapsedRealtime()
-        val counted = if (pkg == IG) handleIg(e, now) else handleYt(e, now)
-        if (!counted) return
+        if (pkg == IG) {
+            if (handleIg(e, now)) registerReel(0, now)
+        } else {
+            handler.removeCallbacks(ytRescan)
+            handler.postDelayed(ytRescan, 800)
+            if (evalYt(now, false)) registerReel(1, now)
+        }
+    }
 
+    private fun registerReel(src: Int, now: Long) {
         lastCount = now
-        val trig = store.addReel(0)
+        val trig = store.addReel(src)
         refreshPill()
         val t = store.total()
-        store.dbg("counted -> $t")
+        store.dbg("${if (src == 0) "IG" else "YT"} counted -> $t")
         when {
             trig != 0 -> { performGlobalAction(GLOBAL_ACTION_HOME); showBreathe() }
             store.isBlocked() -> showBlock()
@@ -104,6 +119,7 @@ class ReelService : AccessibilityService() {
     }
 
     private fun setReels(on: Boolean) {
+        if (!on) lastIdx = -1
         reelsOn = on
         if (on) showPill() else hidePill()
     }
@@ -136,42 +152,67 @@ class ReelService : AccessibilityService() {
         return IG_IDS.any { root.findAccessibilityNodeInfosByViewId(it).isNotEmpty() }
     }
 
-    // ---------- YouTube: count when the Short's title/channel text changes ----------
-    private fun handleYt(e: AccessibilityEvent, now: Long): Boolean {
-        if (now - lastVis < 700) return false
+    // ---------- YouTube: count when the on-screen Short page changes ----------
+    private fun evalYt(now: Long, force: Boolean): Boolean {
+        if (!force && now - lastVis < 700) return false
         lastVis = now
-        val s = scanYt()
-        setReels(s.reel)
-        if (!s.reel) { lastTokens = emptySet(); return false }
+        val root = rootInActiveWindow
+        if (root == null || root.packageName?.toString() != YT) { leaveShorts(); return false }
+        val s = scanYt(root)
+        if (!s.found) {
+            ytMiss++
+            if (ytMiss >= 2) leaveShorts()
+            return false
+        }
+        ytMiss = 0
+        setReels(true)
         if (store.isBlocked()) { showBlock(); return false }
         if (now < commentsUntil) return false
-        if (s.tokens.isEmpty()) {
-            return e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastCount >= 1200
-        }
-        if (s.tokens.none { it !in lastTokens }) return false
+        val keyChanged = s.key != lastKey
+        val newTok = s.tokens.count { it !in ytTokens }
+        val tokenChanged = !keyChanged && !keyTrusted && newTok >= 2 && now - lastCount >= 2500
+        if (!keyChanged && !tokenChanged) return false
         if (commentsOpen()) { commentsUntil = now + 2500; return false }
-        lastTokens = s.tokens
-        return now - lastCount >= 1200
+        if (keyChanged && lastKey != 0) keyTrusted = true
+        store.dbg("YT ${if (keyChanged) "page" else "text"} ${s.ids}")
+        lastKey = s.key
+        ytTokens = s.tokens
+        return now - lastCount >= 1000
     }
 
-    private fun scanYt(): Scan {
-        val root = rootInActiveWindow ?: return Scan(emptySet(), false)
+    private fun leaveShorts() {
+        setReels(false)
+        lastKey = 0
+        ytTokens = emptySet()
+        keyTrusted = false
+        ytMiss = 0
+    }
+
+    /** Finds full-screen Shorts page views (their identity changes per Short) plus visible text. */
+    private fun scanYt(root: AccessibilityNodeInfo): Scan {
         val dm = resources.displayMetrics
         val r = Rect()
         val toks = LinkedHashSet<String>()
+        val cand = ArrayList<String>()
         val big = ArrayList<String>()
-        var reel = false
+        var found = false
+        var key = 0
         var nodes = 0
         fun walk(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 30 || nodes > 500) return
+            if (node == null || depth > 30 || nodes > 600) return
             nodes++
             if (!node.isVisibleToUser) return
             node.getBoundsInScreen(r)
             val id = node.viewIdResourceName
             if (id != null && r.width() >= dm.widthPixels * 0.85f && r.height() >= dm.heightPixels * 0.5f) {
                 val sid = id.substringAfter(":id/")
-                if (sid.contains("reel", true) || sid.contains("short", true)) reel = true
-                else if (big.size < 5 && !big.contains(sid)) big.add(sid)
+                if (sid.contains("reel", true) || sid.contains("short", true)) {
+                    found = true
+                    key = key * 31 + node.hashCode() + 1
+                    if (cand.size < 4) cand.add(sid)
+                } else if (big.size < 5 && !big.contains(sid)) {
+                    big.add(sid)
+                }
             }
             val t = node.text?.toString()
             if (t != null && toks.size < 40) {
@@ -182,11 +223,11 @@ class ReelService : AccessibilityService() {
         }
         walk(root, 0)
         val now = SystemClock.elapsedRealtime()
-        if (!reel && big.isNotEmpty() && now - lastBig > 10_000) {
+        if (!found && big.isNotEmpty() && now - lastBig > 10_000) {
             lastBig = now
             store.dbg("YT big: " + big.joinToString(","))
         }
-        return Scan(toks, reel)
+        return Scan(found, key, toks, cand.joinToString(","))
     }
 
     /** The comment sheet has a text box; reels/shorts themselves don't. */
@@ -259,7 +300,7 @@ class ReelService : AccessibilityService() {
     }
 
     private fun refreshPill() {
-        counter?.text = "Reels ${store.total()} / ${store.cap}"
+        counter?.text = "IG ${store.ig()}  YT ${store.yt()}  •  ${store.total()}/${store.cap}"
         pillBrain?.integrity = store.integrity()
     }
 
@@ -344,11 +385,15 @@ class ReelService : AccessibilityService() {
     }
 
     private fun hideAll() {
+        handler.removeCallbacks(ytRescan)
         hidePill()
         hideBlock()
         reelsOn = false
         lastIdx = -1
-        lastTokens = emptySet()
+        lastKey = 0
+        ytTokens = emptySet()
+        keyTrusted = false
+        ytMiss = 0
     }
 
     // ---------- breathing gate ----------
