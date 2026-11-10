@@ -165,7 +165,7 @@ class MainActivity : AppCompatActivity() {
         val i = store.integrity()
         brain.integrity = i
         bar.value = i
-        todayTv.text = "Today: ${store.total()} / ${store.cap}"
+        todayTv.text = "Today: ${store.total()} / ${store.cap}   (IG ${store.ig()} · YT ${store.yt()})"
         streakTv.text = "Streak: ${store.streak()} days under limit  ·  Best: ${store.bestStreak()}"
         val map = store.allDays().associateBy { it.date }
         calBox.removeAllViews()
