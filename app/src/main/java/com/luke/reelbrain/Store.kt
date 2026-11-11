@@ -119,7 +119,7 @@ fun resetToday() {
 }
     fun dbg(line: String) {
         val old = (p.getString("dbg", "") ?: "").split("\n").filter { it.isNotBlank() }
-        p.edit().putString("dbg", (listOf(line) + old).take(6).joinToString("\n")).apply()
+        p.edit().putString("dbg", (listOf(line) + old).take(14).joinToString("\n")).apply()
     }
     fun dbgText(): String = p.getString("dbg", "") ?: ""
 }
