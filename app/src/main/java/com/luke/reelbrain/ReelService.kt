@@ -26,12 +26,10 @@ class ReelService : AccessibilityService() {
         const val IG = "com.instagram.android"
         const val YT = "com.google.android.youtube"
         val IG_IDS = listOf("com.instagram.android:id/clips_viewer_view_pager")
-        val SKIP = listOf("subscribe", "comment", "share", "remix", "mute", "search", "shorts", "library", "pause", "play")
+        val LEAVE = setOf("home", "subscriptions", "you", "library", "search", "explore", "trending", "create", "notifications")
         const val CYCLE = 12_000L
         const val BREATHS = 10
     }
-
-    private class Scan(val found: Boolean, val key: Int, val tokens: Set<String>, val ids: String)
 
     private val store by lazy { Store(this) }
     private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
@@ -45,31 +43,32 @@ class ReelService : AccessibilityService() {
     private var breathe: FrameLayout? = null
     private var bv: BreathView? = null
     private var lastPkg = IG
-    private var reelsOn = false
+    private var igOn = false
+    private var ytOn = false
     private var lastCount = 0L
     private var lastVis = 0L
-    private var lastBig = 0L
+    private var lastLog = 0L
     private var lastIdx = -1
+    private var ytIdx = -1
+    private var ytEnterAt = 0L
+    private var ytBaselineUntil = 0L
+    private var ytTapEntry = false
+    private var ytGone = 0
     private var commentsUntil = 0L
-    private var lastKey = 0
-    private var ytTokens: Set<String> = emptySet()
-    private var ytMiss = 0
-    private var keyTrusted = false
     private var misses = 0
     private var breathStart = 0L
 
     private val hidePopup = Runnable { popupView?.visibility = View.GONE }
     private val autoLeave = Runnable { if (block != null) leaveBlock() }
-    private val ytRescan = Runnable {
-        if (breathe != null) return@Runnable
-        val now = SystemClock.elapsedRealtime()
-        if (evalYt(now, true)) registerReel(1, now)
-    }
     private val poll = object : Runnable {
         override fun run() {
             val pkg = rootInActiveWindow?.packageName?.toString()
             if (pkg == IG || pkg == YT) misses = 0 else misses++
             if (misses >= 2) { hideAll(); return }
+            if (pkg == YT && ytOn && SystemClock.elapsedRealtime() - ytEnterAt > 3000) {
+                if (reelNodeVisible()) ytGone = 0
+                else if (++ytGone >= 2) { leaveShorts("no reel view on screen"); hidePill(); return }
+            }
             handler.postDelayed(this, 1000)
         }
     }
@@ -96,13 +95,14 @@ class ReelService : AccessibilityService() {
         if (breathe != null) return
         lastPkg = pkg
         val now = SystemClock.elapsedRealtime()
-        if (pkg == IG) {
-            if (handleIg(e, now)) registerReel(0, now)
-        } else {
-            handler.removeCallbacks(ytRescan)
-            handler.postDelayed(ytRescan, 800)
-            if (evalYt(now, false)) registerReel(1, now)
-        }
+        val counted = if (pkg == IG) handleIg(e, now) else handleYt(e, now)
+        syncPill()
+        if (counted) registerReel(if (pkg == IG) 0 else 1, now)
+    }
+
+    private fun syncPill() {
+        val on = if (lastPkg == IG) igOn else ytOn
+        if (on) showPill() else hidePill()
     }
 
     private fun registerReel(src: Int, now: Long) {
@@ -118,31 +118,25 @@ class ReelService : AccessibilityService() {
         }
     }
 
-    private fun setReels(on: Boolean) {
-        if (!on) lastIdx = -1
-        reelsOn = on
-        if (on) showPill() else hidePill()
-    }
-
     // ---------- Instagram: count when the reel pager moves ----------
     private fun handleIg(e: AccessibilityEvent, now: Long): Boolean {
         val scroll = e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
-        val gap = if (scroll && !reelsOn) 300L else 1000L
+        val gap = if (scroll && !igOn) 300L else 1000L
         if (now - lastVis >= gap) {
             lastVis = now
-            setReels(inReels())
-            if (reelsOn && store.isBlocked()) { showBlock(); return false }
+            igOn = inReels()
+            if (!igOn) lastIdx = -1
+            if (igOn && store.isBlocked()) { showBlock(); return false }
         }
-        if (!scroll || !reelsOn) return false
+        if (!scroll || !igOn) return false
 
         val id = e.source?.viewIdResourceName ?: "none"
-        store.dbg("IG ${e.className?.toString()?.substringAfterLast('.')} $id i=${e.fromIndex}")
         if (now < commentsUntil || id.contains("comment", true)) return false
         if (store.isBlocked()) { showBlock(); return false }
         if (now - lastCount < 900) return false
         val idx = e.fromIndex
         if (idx >= 0 && idx == lastIdx) return false
-        if (commentsOpen()) { commentsUntil = now + 2500; return false }
+        if (commentsOpen()) { commentsUntil = now + 2500; store.dbg("IG skipped: comments"); return false }
         if (idx >= 0) lastIdx = idx
         return true
     }
@@ -152,82 +146,106 @@ class ReelService : AccessibilityService() {
         return IG_IDS.any { root.findAccessibilityNodeInfosByViewId(it).isNotEmpty() }
     }
 
-    // ---------- YouTube: count when the on-screen Short page changes ----------
-    private fun evalYt(now: Long, force: Boolean): Boolean {
-        if (!force && now - lastVis < 700) return false
-        lastVis = now
-        val root = rootInActiveWindow
-        if (root == null || root.packageName?.toString() != YT) { leaveShorts(); return false }
-        val s = scanYt(root)
-        if (!s.found) {
-            ytMiss++
-            if (ytMiss >= 2) leaveShorts()
-            return false
+    // ---------- YouTube: explicit enter/exit + full-screen single-page swipes ----------
+    private fun handleYt(e: AccessibilityEvent, now: Long): Boolean {
+        if (e.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) { ytClick(e, now); return false }
+        if (e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) return ytScroll(e, now)
+        return false
+    }
+
+    private fun labelsOf(e: AccessibilityEvent): List<String> {
+        val out = ArrayList<String>()
+        var n: AccessibilityNodeInfo? = e.source
+        var d = 0
+        while (n != null && d < 5) {
+            n.contentDescription?.toString()?.let { if (it.isNotBlank()) out.add(it.trim()) }
+            n.text?.toString()?.let { if (it.isNotBlank()) out.add(it.trim()) }
+            n = n.parent
+            d++
         }
-        ytMiss = 0
-        setReels(true)
-        if (store.isBlocked()) { showBlock(); return false }
-        if (now < commentsUntil) return false
-        val keyChanged = s.key != lastKey
-        val newTok = s.tokens.count { it !in ytTokens }
-        val tokenChanged = !keyChanged && !keyTrusted && newTok >= 2 && now - lastCount >= 2500
-        if (!keyChanged && !tokenChanged) return false
-        if (commentsOpen()) { commentsUntil = now + 2500; return false }
-        if (keyChanged && lastKey != 0) keyTrusted = true
-        store.dbg("YT ${if (keyChanged) "page" else "text"} ${s.ids}")
-        lastKey = s.key
-        ytTokens = s.tokens
-        return now - lastCount >= 1000
+        e.contentDescription?.toString()?.let { if (it.isNotBlank()) out.add(it.trim()) }
+        return out
     }
 
-    private fun leaveShorts() {
-        setReels(false)
-        lastKey = 0
-        ytTokens = emptySet()
-        keyTrusted = false
-        ytMiss = 0
+    private fun ytClick(e: AccessibilityEvent, now: Long) {
+        val labels = labelsOf(e)
+        if (labels.isEmpty()) return
+        val shorts = labels.firstOrNull { it.equals("Shorts", true) || it.contains("play short", true) }
+        if (shorts != null) {
+            if (!ytOn) enterShorts(now, "tap '${shorts.take(20)}'", true)
+            return
+        }
+        val leave = labels.firstOrNull { it.lowercase() in LEAVE || it.contains("play video", true) }
+        if (leave != null && ytOn) leaveShorts("tap '${leave.take(20)}'")
     }
 
-    /** Finds full-screen Shorts page views (their identity changes per Short) plus visible text. */
-    private fun scanYt(root: AccessibilityNodeInfo): Scan {
+    private fun enterShorts(now: Long, why: String, tap: Boolean) {
+        ytOn = true
+        ytIdx = -1
+        ytEnterAt = now
+        ytTapEntry = tap
+        ytBaselineUntil = if (tap) now + 1500 else 0L
+        ytGone = 0
+        store.dbg("YT enter: $why")
+    }
+
+    private fun leaveShorts(why: String) {
+        if (ytOn) store.dbg("YT exit: $why")
+        ytOn = false
+        ytIdx = -1
+        ytGone = 0
+    }
+
+    private fun logIgnored(now: Long, s: String) {
+        if (now - lastLog > 1500) { lastLog = now; store.dbg("YT ignored: $s") }
+    }
+
+    private fun ytScroll(e: AccessibilityEvent, now: Long): Boolean {
+        val src = e.source ?: return false
         val dm = resources.displayMetrics
         val r = Rect()
-        val toks = LinkedHashSet<String>()
-        val cand = ArrayList<String>()
-        val big = ArrayList<String>()
+        src.getBoundsInScreen(r)
+        val from = e.fromIndex
+        val span = if (from >= 0 && e.toIndex >= 0) e.toIndex - from else -1
+        val cls = e.className?.toString()?.substringAfterLast('.') ?: "?"
+        val full = r.width() >= dm.widthPixels * 0.9f && r.height() >= dm.heightPixels * 0.75f
+        if (!full) {
+            if (ytOn) logIgnored(now, "small $cls ${r.width()}x${r.height()}")
+            return false
+        }
+        if (span >= 2) {
+            if (ytOn) leaveShorts("list scroll $cls span=$span")
+            return false
+        }
+        if (!ytOn) enterShorts(now, "swipe $cls", false)
+        if (store.isBlocked()) { showBlock(); return false }
+        if (now < commentsUntil) return false
+        if (from >= 0) {
+            if (from == ytIdx) return false
+            if (ytIdx == -1 && (now < ytBaselineUntil || !ytTapEntry)) { ytIdx = from; return false }
+            if (commentsOpen()) { commentsUntil = now + 2500; store.dbg("YT skipped: comments"); return false }
+            ytIdx = from
+            return now - lastCount >= 600
+        }
+        if (now - ytEnterAt < 1500 || now - lastCount < 1000) return false
+        if (commentsOpen()) { commentsUntil = now + 2500; store.dbg("YT skipped: comments"); return false }
+        return true
+    }
+
+    private fun reelNodeVisible(): Boolean {
+        val root = rootInActiveWindow ?: return false
         var found = false
-        var key = 0
         var nodes = 0
         fun walk(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 30 || nodes > 600) return
+            if (found || node == null || depth > 25 || nodes > 400) return
             nodes++
             if (!node.isVisibleToUser) return
-            node.getBoundsInScreen(r)
             val id = node.viewIdResourceName
-            if (id != null && r.width() >= dm.widthPixels * 0.85f && r.height() >= dm.heightPixels * 0.5f) {
-                val sid = id.substringAfter(":id/")
-                if (sid.contains("reel", true) || sid.contains("short", true)) {
-                    found = true
-                    key = key * 31 + node.hashCode() + 1
-                    if (cand.size < 4) cand.add(sid)
-                } else if (big.size < 5 && !big.contains(sid)) {
-                    big.add(sid)
-                }
-            }
-            val t = node.text?.toString()
-            if (t != null && toks.size < 40) {
-                val c = t.filter { !it.isDigit() }.trim().take(60)
-                if (c.length >= 4 && SKIP.none { c.contains(it, true) }) toks.add(c)
-            }
+            if (id != null && id.contains("reel", true)) { found = true; return }
             for (i in 0 until node.childCount) walk(node.getChild(i), depth + 1)
         }
         walk(root, 0)
-        val now = SystemClock.elapsedRealtime()
-        if (!found && big.isNotEmpty() && now - lastBig > 10_000) {
-            lastBig = now
-            store.dbg("YT big: " + big.joinToString(","))
-        }
-        return Scan(found, key, toks, cand.joinToString(","))
+        return found
     }
 
     /** The comment sheet has a text box; reels/shorts themselves don't. */
@@ -385,15 +403,13 @@ class ReelService : AccessibilityService() {
     }
 
     private fun hideAll() {
-        handler.removeCallbacks(ytRescan)
         hidePill()
         hideBlock()
-        reelsOn = false
+        igOn = false
+        ytOn = false
         lastIdx = -1
-        lastKey = 0
-        ytTokens = emptySet()
-        keyTrusted = false
-        ytMiss = 0
+        ytIdx = -1
+        ytGone = 0
     }
 
     // ---------- breathing gate ----------
